@@ -38,6 +38,7 @@ A Magisk module is a folder placed in `/data/adb/modules` with the structure bel
 │   ├── zygisk              <--- This folder contains the module's Zygisk native libraries
 │   │   ├── arm64-v8a.so
 │   │   ├── armeabi-v7a.so
+│   │   ├── riscv64.so
 │   │   ├── x86.so
 │   │   ├── x86_64.so
 │   │   └── unloaded        <--- If exists, the native libraries are incompatible
@@ -53,6 +54,7 @@ A Magisk module is a folder placed in `/data/adb/modules` with the structure bel
 │   ├── post-fs-data.sh     <--- This script will be executed in post-fs-data
 │   ├── service.sh          <--- This script will be executed in late_start service
 |   ├── uninstall.sh        <--- This script will be executed when Magisk removes your module
+|   ├── action.sh           <--- This script will be executed when user click the action button in Magisk app
 │   ├── system.prop         <--- Properties in this file will be loaded as system properties by resetprop
 │   ├── sepolicy.rule       <--- Additional custom sepolicy rules
 │   │
@@ -176,8 +178,8 @@ The `customize.sh` script runs in Magisk's BusyBox `ash` shell with "Standalone 
 - `MODPATH` (path): the path where your module files should be installed
 - `TMPDIR` (path): a place where you can temporarily store files
 - `ZIPFILE` (path): your module's installation zip
-- `ARCH` (string): the CPU architecture of the device. Value is either `arm`, `arm64`, `x86`, or `x64`
-- `IS64BIT` (bool): `true` if `$ARCH` is either `arm64` or `x64`
+- `ARCH` (string): the CPU architecture of the device. Value is either `arm`, `arm64`, `x86`, `x64`, or `riscv64`
+- `IS64BIT` (bool): `true` if `$ARCH` is either `arm64`, `x64`, or `riscv64`
 - `API` (int): the API level (Android version) of the device (e.g. `23` for Android 6.0)
 
 ##### Functions
@@ -230,7 +232,7 @@ The list above will result in the following files being created: `$MODPATH/syste
 In Magisk, you can run boot scripts in 2 different modes: **post-fs-data** and **late_start service** mode.
 
 - post-fs-data mode
-  - This stage is BLOCKING. The boot process is paused before execution is done, or 10 seconds have passed.
+  - This stage is BLOCKING. The boot process is paused before execution is done, or 40 seconds have passed.
   - Scripts run before any modules are mounted. This allows a module developer to dynamically adjust their modules before it gets mounted.
   - This stage happens before Zygote is started, which pretty much means everything in Android
   - **WARNING:** using `setprop` will deadlock the boot process! Please use `resetprop -n <prop_name> <prop_value>` instead.

@@ -17,7 +17,7 @@ string native_bridge = "0";
 
 static bool is_compatible_with(uint32_t) {
     zygisk_logging();
-    hook_functions();
+    hook_entry();
     ZLOGD("load success\n");
     return false;
 }
@@ -55,12 +55,13 @@ static vector<int> get_module_fds(bool is_64_bit) {
     // All fds passed to send_fds have to be valid file descriptors.
     // To workaround this issue, send over STDOUT_FILENO as an indicator of an
     // invalid fd as it will always be /dev/null in magiskd
-    if (is_64_bit) {
 #if defined(__LP64__)
+    if (is_64_bit) {
         std::transform(module_list->begin(), module_list->end(), std::back_inserter(fds),
             [](const module_info &info) { return info.z64 < 0 ? STDOUT_FILENO : info.z64; });
+    } else
 #endif
-    } else {
+    {
         std::transform(module_list->begin(), module_list->end(), std::back_inserter(fds),
             [](const module_info &info) { return info.z32 < 0 ? STDOUT_FILENO : info.z32; });
     }
@@ -128,12 +129,10 @@ static void get_process_info(int client, const sock_cred *cred) {
 
     uint32_t flags = 0;
 
-    check_pkg_refresh();
     if (is_deny_target(uid, process)) {
         flags |= PROCESS_ON_DENYLIST;
     }
-    int manager_app_id = get_manager();
-    if (to_app_id(uid) == manager_app_id) {
+    if (get_manager(to_user_id(uid)) == uid) {
         flags |= PROCESS_IS_MAGISK_APP;
     }
     if (denylist_enforced) {

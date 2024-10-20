@@ -34,7 +34,16 @@ if [ -z "$FIRST_STAGE" ]; then
   export FIRST_STAGE=1
   export ASH_STANDALONE=1
   # Re-exec script with busybox
-  exec ./busybox sh $0
+  exec ./busybox sh $0 "$@"
+fi
+
+TARGET_FILE="$1"
+OUTPUT_FILE="$1.magisk"
+
+if echo "$TARGET_FILE" | grep -q 'ramdisk'; then
+  IS_RAMDISK=true
+else
+  IS_RAMDISK=false
 fi
 
 # Extract files from APK
@@ -49,7 +58,11 @@ for file in lib*.so; do
   mv "$file" "${file:3:${#file}-6}"
 done
 
-./magiskboot decompress ramdisk.cpio.tmp ramdisk.cpio
+if $IS_RAMDISK; then
+  ./magiskboot decompress "$TARGET_FILE" ramdisk.cpio
+else
+  ./magiskboot unpack "$TARGET_FILE"
+fi
 cp ramdisk.cpio ramdisk.cpio.orig
 
 export KEEPVERITY=true
@@ -58,13 +71,14 @@ export KEEPFORCEENCRYPT=true
 echo "KEEPVERITY=$KEEPVERITY" > config
 echo "KEEPFORCEENCRYPT=$KEEPFORCEENCRYPT" >> config
 echo "PREINITDEVICE=$(./magisk --preinit-device)" >> config
-# For API 28, we also patch advancedFeatures.ini to disable SAR
-# Manually override skip_initramfs by setting RECOVERYMODE=true
+# For API 28, we also manually disable SystemAsRoot
+# Explicitly override skip_initramfs by setting RECOVERYMODE=true
 [ $API = "28" ] && echo 'RECOVERYMODE=true' >> config
 cat config
 
 ./magiskboot compress=xz magisk magisk.xz
 ./magiskboot compress=xz stub.apk stub.xz
+./magiskboot compress=xz init-ld init-ld.xz
 
 ./magiskboot cpio ramdisk.cpio \
 "add 0750 init magiskinit" \
@@ -72,10 +86,16 @@ cat config
 "mkdir 0750 overlay.d/sbin" \
 "add 0644 overlay.d/sbin/magisk.xz magisk.xz" \
 "add 0644 overlay.d/sbin/stub.xz stub.xz" \
+"add 0644 overlay.d/sbin/init-ld.xz init-ld.xz" \
 "patch" \
 "backup ramdisk.cpio.orig" \
 "mkdir 000 .backup" \
 "add 000 .backup/.magisk config"
 
-rm -f ramdisk.cpio.orig config magisk*.xz stub.xz
-./magiskboot compress=gzip ramdisk.cpio ramdisk.cpio.gz
+rm -f ramdisk.cpio.orig config *.xz
+if $IS_RAMDISK; then
+  ./magiskboot compress=gzip ramdisk.cpio "$OUTPUT_FILE"
+else
+  ./magiskboot repack "$TARGET_FILE" "$OUTPUT_FILE"
+  ./magiskboot cleanup
+fi

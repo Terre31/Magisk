@@ -52,7 +52,7 @@ ifdef B_PRELOAD
 include $(CLEAR_VARS)
 LOCAL_MODULE := init-ld
 LOCAL_SRC_FILES := init/preload.c
-LOCAL_STRIP_MODE := --strip-all
+LOCAL_LDFLAGS := -Wl,--strip-all
 include $(BUILD_SHARED_LIBRARY)
 
 endif
@@ -172,9 +172,3 @@ include $(BUILD_STATIC_LIBRARY)
 include src/Android-rs.mk
 include src/base/Android.mk
 include src/external/Android.mk
-
-ifdef B_BB
-
-include src/external/busybox/Android.mk
-
-endif

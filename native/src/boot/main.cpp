@@ -7,8 +7,12 @@
 using namespace std;
 
 #ifdef USE_CRT0
-__asm__(".global vfprintf \n vfprintf = musl_vfprintf");
-__asm__(".global vsscanf \n vsscanf = tfp_vsscanf");
+__BEGIN_DECLS
+int musl_vfprintf(FILE *stream, const char *format, va_list arg);
+int vfprintf(FILE *stream, const char *format, va_list arg) {
+    return musl_vfprintf(stream, format, arg);
+}
+__END_DECLS
 #endif
 
 static void print_formats() {
@@ -40,7 +44,9 @@ Supported actions:
 
   repack [-n] <origbootimg> [outbootimg]
     Repack boot image components using files from the current directory
-    to [outbootimg], or 'new-boot.img' if not specified.
+    to [outbootimg], or 'new-boot.img' if not specified. Current directory
+    should only contain required files for [outbootimg], or incorrect
+    [outbootimg] may be produced.
     <origbootimg> is the original boot image used to unpack the components.
     By default, each component will be automatically compressed using its
     corresponding format detected in <origbootimg>. If a component file
@@ -142,6 +148,8 @@ int main(int argc, char *argv[]) {
         unlink(EXTRA_FILE);
         unlink(RECV_DTBO_FILE);
         unlink(DTB_FILE);
+        unlink(BOOTCONFIG_FILE);
+        rm_rf(VND_RAMDISK_DIR);
     } else if (argc > 2 && action == "sha1") {
         uint8_t sha1[20];
         {

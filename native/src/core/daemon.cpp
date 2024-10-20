@@ -158,6 +158,7 @@ static void handle_request_async(int client, int code, const sock_cred &cred) {
     case +RequestCode::ZYGOTE_RESTART:
         LOGI("** zygote restarted\n");
         prune_su_access();
+        scan_deny_apps();
         reset_zygisk(false);
         close(client);
         break;
@@ -390,21 +391,6 @@ static void daemon_entry() {
     }
     ssprintf(path, sizeof(path), "%s/" ROOTOVL, tmp);
     rm_rf(path);
-
-    // Use isolated devpts if kernel support
-    if (access("/dev/pts/ptmx", F_OK) == 0) {
-        ssprintf(path, sizeof(path), "%s/" SHELLPTS, tmp);
-        if (access(path, F_OK)) {
-            xmkdirs(path, 0755);
-            xmount("devpts", path, "devpts", MS_NOSUID | MS_NOEXEC, "newinstance");
-            char ptmx[64];
-            ssprintf(ptmx, sizeof(ptmx), "%s/ptmx", path);
-            if (access(ptmx, F_OK)) {
-                xumount(path);
-                rmdir(path);
-            }
-        }
-    }
 
     fd = xsocket(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_un addr = {.sun_family = AF_LOCAL};

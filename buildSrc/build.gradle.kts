@@ -1,6 +1,9 @@
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+
 plugins {
     `kotlin-dsl`
 }
+
 repositories {
     google()
     mavenCentral()
@@ -15,10 +18,17 @@ gradlePlugin {
     }
 }
 
+tasks.withType<KotlinCompile>().configureEach {
+    kotlinOptions {
+        languageVersion = "2.0"
+    }
+}
+
 dependencies {
-    implementation(embeddedKotlin("gradle-plugin"))
-    implementation("com.android.tools.build:gradle:8.4.0")
-    implementation("androidx.navigation:navigation-safe-args-gradle-plugin:2.7.7")
-    implementation("org.lsposed.lsparanoid:gradle-plugin:0.5.2")
-    implementation("org.eclipse.jgit:org.eclipse.jgit:6.7.0.202309050840-r")
+    implementation(kotlin("gradle-plugin", libs.versions.kotlin.get()))
+    implementation(libs.android.gradle.plugin)
+    implementation(libs.ksp.plugin)
+    implementation(libs.navigation.safe.args.plugin)
+    implementation(libs.lsparanoid.plugin)
+    implementation(libs.jgit)
 }

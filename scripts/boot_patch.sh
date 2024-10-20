@@ -20,6 +20,7 @@
 # magiskinit         binary    The binary to replace /init.
 # magisk             binary    The magisk binary.
 # magiskboot         binary    A tool to manipulate boot images.
+# init-ld            binary    The library that will be LD_PRELOAD of /init
 # stub.apk           binary    The stub Magisk app to embed into ramdisk.
 # chromeos           folder    This folder includes the utility and keys to sign
 #                  (optional)  chromeos boot images. Only used for Pixel C.
@@ -118,14 +119,16 @@ else
   STATUS=0
   SKIP_BACKUP="#"
 fi
-case $((STATUS & 3)) in
-  0 )  # Stock boot
+case $STATUS in
+  0 )
+    # Stock boot
     ui_print "- Stock boot image detected"
     SHA1=$(./magiskboot sha1 "$BOOTIMAGE" 2>/dev/null)
     cat $BOOTIMAGE > stock_boot.img
     cp -af ramdisk.cpio ramdisk.cpio.orig 2>/dev/null
     ;;
-  1 )  # Magisk patched
+  1 )
+    # Magisk patched
     ui_print "- Magisk patched boot image detected"
     ./magiskboot cpio ramdisk.cpio \
     "extract .backup/.magisk config.orig" \
@@ -133,7 +136,8 @@ case $((STATUS & 3)) in
     cp -af ramdisk.cpio ramdisk.cpio.orig
     rm -f stock_boot.img
     ;;
-  2 )  # Unsupported
+  2 )
+    # Unsupported
     ui_print "! Boot image patched by unsupported programs"
     abort "! Please restore back to stock boot image"
     ;;
@@ -161,6 +165,7 @@ $BOOTMODE && [ -z "$PREINITDEVICE" ] && PREINITDEVICE=$(./magisk --preinit-devic
 # Compress to save precious ramdisk space
 ./magiskboot compress=xz magisk magisk.xz
 ./magiskboot compress=xz stub.apk stub.xz
+./magiskboot compress=xz init-ld init-ld.xz
 
 echo "KEEPVERITY=$KEEPVERITY" > config
 echo "KEEPFORCEENCRYPT=$KEEPFORCEENCRYPT" >> config
@@ -177,13 +182,14 @@ fi
 "mkdir 0750 overlay.d/sbin" \
 "add 0644 overlay.d/sbin/magisk.xz magisk.xz" \
 "add 0644 overlay.d/sbin/stub.xz stub.xz" \
+"add 0644 overlay.d/sbin/init-ld.xz init-ld.xz" \
 "patch" \
 "$SKIP_BACKUP backup ramdisk.cpio.orig" \
 "mkdir 000 .backup" \
 "add 000 .backup/.magisk config" \
 || abort "! Unable to patch ramdisk"
 
-rm -f ramdisk.cpio.orig config magisk*.xz stub.xz
+rm -f ramdisk.cpio.orig config *.xz
 
 #################
 # Binary Patches
@@ -213,6 +219,13 @@ if [ -f kernel ]; then
   # Before: [mov w2, #-221]   (-__NR_execve)
   # After:  [mov w2, #-32768]
   ./magiskboot hexpatch kernel 821B8012 E2FF8F12 && PATCHEDKERNEL=true
+
+  # Disable Samsung PROCA
+  # proca_config -> proca_magisk
+  ./magiskboot hexpatch kernel \
+  70726F63615F636F6E66696700 \
+  70726F63615F6D616769736B00 \
+  && PATCHEDKERNEL=true
 
   # Force kernel to load rootfs for legacy SAR devices
   # skip_initramfs -> want_initramfs

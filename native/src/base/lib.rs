@@ -1,7 +1,6 @@
 #![allow(clippy::missing_safety_doc)]
 #![feature(format_args_nl)]
 #![feature(io_error_more)]
-#![feature(utf8_chunks)]
 
 pub use const_format;
 pub use libc;
@@ -62,6 +61,8 @@ pub mod ffi {
         fn fd_path_for_cxx(fd: i32, buf: &mut [u8]) -> isize;
         #[cxx_name = "map_file"]
         fn map_file_for_cxx(path: Utf8CStrRef, rw: bool) -> &'static mut [u8];
+        #[cxx_name = "map_file_at"]
+        fn map_file_at_for_cxx(fd: i32, path: Utf8CStrRef, rw: bool) -> &'static mut [u8];
         #[cxx_name = "map_fd"]
         fn map_fd_for_cxx(fd: i32, sz: usize, rw: bool) -> &'static mut [u8];
     }

@@ -1,6 +1,7 @@
 #include <sys/mount.h>
 #include <dlfcn.h>
 #include <unwind.h>
+#include <span>
 
 #include <lsplt.hpp>
 
@@ -9,7 +10,6 @@
 
 #include "zygisk.hpp"
 #include "module.hpp"
-#include "jni_hooks.hpp"
 
 using namespace std;
 
@@ -51,18 +51,12 @@ using namespace std;
 //         └──────────────────────┼────────────────►│post_native_bridge_load│
 //                                │                 └───────────────────────┘
 //                                ▼
-//                  ┌──────────────────────────┐
-//                  │androidSetCreateThreadFunc│
-//                  └─────────────┬────┬───────┘
-//                                │    │                 ┌────────────┐
-//                                │    └────────────────►│hook_jni_env│
-//                                ▼                      └────────────┘
-//                       ┌──────────────────┐
-//                       │register_jni_procs│
-//                       └────────┬────┬────┘
-//                                │    │              ┌───────────────────┐
-//                                │    └─────────────►│replace_jni_methods│
-//                                │                   └───────────────────┘     ┌─────────┐
+//                    ┌──────────────────────┐
+//                    │ strdup("ZygoteInit") │
+//                    └───────────┬────┬─────┘
+//                                │    │                ┌───────────────┐
+//                                │    └───────────────►│hook_zygote_jni│
+//                                │                     └───────────────┘       ┌─────────┐
 //                                │                                             │         │
 //                                └────────────────────────────────────────────►│   JVM   │
 //                                                                              │         │
@@ -83,35 +77,17 @@ using namespace std;
 // Some notes regarding the important functions/symbols during bootstrap:
 //
 // * NativeBridgeItf: this symbol is the entry point for android::LoadNativeBridge
-// * HookContext::hook_plt(): hook functions like |dlclose| and |androidSetCreateThreadFunc|
-// * dlclose: the final step before android::LoadNativeBridge returns
-// * androidSetCreateThreadFunc: called in AndroidRuntime::startReg before
-//   |register_jni_procs|, which is when most native JNI methods are registered.
-// * HookContext::hook_jni_env(): replace the |RegisterNatives| function pointer in JNIEnv.
-// * replace_jni_methods: called in the replaced |RegisterNatives| function to filter and replace
-//   the function pointers registered in register_jni_procs, most importantly the process
-//   specialization routines, which are our main targets. This marks the final step
-//   of the code injection bootstrap process.
+// * HookContext::hook_plt(): hook functions like |dlclose| and |strdup|
+// * dlclose: the final step in android::LoadNativeBridge. In this function, we unwind the call
+//   stack to load the real native bridge if necessary, and fetch NativeBridgeRuntimeCallbacks.
+// * strdup: called in AndroidRuntime::start before calling ZygoteInit#main(...)
+// * HookContext::hook_zygote_jni(): replace the process specialization functions registered
+//   with register_jni_procs. This marks the final step of the code injection bootstrap process.
 // * pthread_attr_destroy: called whenever the JVM tries to setup threads for itself. We use
 //   this method to cleanup and unload Zygisk from the process.
 
-struct HookContext {
-    vector<tuple<dev_t, ino_t, const char *, void **>> plt_backup;
-    map<string, vector<JNINativeMethod>, StringCmp> jni_backup;
-    JNINativeInterface new_env{};
-    const JNINativeInterface *old_env = nullptr;
-    const NativeBridgeRuntimeCallbacks *runtime_callbacks = nullptr;
-
-    void hook_plt();
-    void hook_unloader();
-    void restore_plt_hook();
-    void hook_jni_env();
-    void restore_jni_hook(JNIEnv *env);
-    void post_native_bridge_load();
-
-private:
-    void register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func);
-};
+constexpr const char *kZygoteInit = "com.android.internal.os.ZygoteInit";
+constexpr const char *kZygote = "com/android/internal/os/Zygote";
 
 // Global contexts:
 //
@@ -122,9 +98,31 @@ private:
 // features, such as loading modules and customizing process fork/specialization.
 
 ZygiskContext *g_ctx;
+struct HookContext;
 static HookContext *g_hook;
-static bool should_unmap_zygisk = false;
-static void *self_handle = nullptr;
+
+using JNIMethods = std::span<JNINativeMethod>;
+
+struct HookContext {
+#include "jni_hooks.hpp"
+
+    // std::array<JNINativeMethod> zygote_methods
+    vector<tuple<dev_t, ino_t, const char *, void **>> plt_backup;
+    const NativeBridgeRuntimeCallbacks *runtime_callbacks = nullptr;
+    void *self_handle = nullptr;
+    bool should_unmap = false;
+
+    void hook_plt();
+    void hook_unloader();
+    void restore_plt_hook();
+    void hook_zygote_jni();
+    void restore_zygote_hook(JNIEnv *env);
+    void hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods methods);
+    void post_native_bridge_load(void *handle);
+
+private:
+    void register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func);
+};
 
 // -----------------------------------------------------------------
 
@@ -132,10 +130,11 @@ static void *self_handle = nullptr;
 ret (*old_##func)(__VA_ARGS__);       \
 ret new_##func(__VA_ARGS__)
 
-DCL_HOOK_FUNC(static void, androidSetCreateThreadFunc, void *func) {
-    ZLOGD("androidSetCreateThreadFunc\n");
-    g_hook->hook_jni_env();
-    old_androidSetCreateThreadFunc(func);
+DCL_HOOK_FUNC(static char *, strdup, const char * str) {
+    if (strcmp(kZygoteInit, str) == 0) {
+        g_hook->hook_zygote_jni();
+    }
+    return old_strdup(str);
 }
 
 // Skip actual fork and return cached result if applicable
@@ -176,10 +175,9 @@ DCL_HOOK_FUNC(static void, android_log_close) {
 
 // It should be safe to assume all dlclose's in libnativebridge are for zygisk_loader
 DCL_HOOK_FUNC(static int, dlclose, void *handle) {
-    if (!self_handle) {
+    if (!g_hook->self_handle) {
         ZLOGV("dlclose zygisk_loader\n");
-        self_handle = handle;
-        g_hook->post_native_bridge_load();
+        g_hook->post_native_bridge_load(handle);
     }
     return 0;
 }
@@ -195,10 +193,11 @@ DCL_HOOK_FUNC(static int, pthread_attr_destroy, void *target) {
         return res;
 
     ZLOGV("pthread_attr_destroy\n");
-    if (should_unmap_zygisk) {
+    if (g_hook->should_unmap) {
         g_hook->restore_plt_hook();
-        if (should_unmap_zygisk) {
+        if (g_hook->should_unmap) {
             ZLOGV("dlclosing self\n");
+            void *self_handle = g_hook->self_handle;
             delete g_hook;
 
             // Because both `pthread_attr_destroy` and `dlclose` have the same function signature,
@@ -238,8 +237,8 @@ ZygiskContext::~ZygiskContext() {
     }
 
     // Cleanup
-    should_unmap_zygisk = true;
-    g_hook->restore_jni_hook(env);
+    g_hook->should_unmap = true;
+    g_hook->restore_zygote_hook(env);
     g_hook->hook_unloader();
 }
 
@@ -313,13 +312,22 @@ static const NativeBridgeRuntimeCallbacks* find_runtime_callbacks(struct _Unwind
         if (val >= start && val < end)
             return reinterpret_cast<const NativeBridgeRuntimeCallbacks*>(val);
     }
+#elif defined(__riscv)
+    // x8-x9, x18-x27 callee-saved registers
+    for (int i : {8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}) {
+        auto val = static_cast<uintptr_t>(_Unwind_GetGR(ctx, i));
+        ZLOGV("x%d = %p\n", i, reinterpret_cast<void *>(val));
+        if (val >= start && val < end)
+            return reinterpret_cast<const NativeBridgeRuntimeCallbacks*>(val);
+    }
 #else
 #error "Unsupported architecture"
 #endif
     return nullptr;
 }
 
-void HookContext::post_native_bridge_load() {
+void HookContext::post_native_bridge_load(void *handle) {
+    self_handle = handle;
     using method_sig = const bool (*)(const char *, const NativeBridgeRuntimeCallbacks *);
     struct trace_arg {
         method_sig load_native_bridge;
@@ -392,8 +400,8 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(native_bridge_dev, native_bridge_inode, dlclose);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, androidSetCreateThreadFunc);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, selinux_android_setcontext);
+    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER_SYM(android_runtime_dev, android_runtime_inode, "__android_log_close", android_log_close);
 
     if (!lsplt::CommitHook())
@@ -403,7 +411,7 @@ void HookContext::hook_plt() {
     plt_backup.erase(
             std::remove_if(plt_backup.begin(), plt_backup.end(),
             [](auto &t) { return *std::get<3>(t) == nullptr;}),
-            g_hook->plt_backup.end());
+            plt_backup.end());
 }
 
 void HookContext::hook_unloader() {
@@ -428,71 +436,63 @@ void HookContext::restore_plt_hook() {
     for (const auto &[dev, inode, sym, old_func] : plt_backup) {
         if (!lsplt::RegisterHook(dev, inode, sym, *old_func, nullptr)) {
             ZLOGE("Failed to register plt_hook [%s]\n", sym);
-            should_unmap_zygisk = false;
+            should_unmap = false;
         }
     }
     if (!lsplt::CommitHook()) {
         ZLOGE("Failed to restore plt_hook\n");
-        should_unmap_zygisk = false;
+        should_unmap = false;
     }
 }
 
 // -----------------------------------------------------------------
 
-static string get_class_name(JNIEnv *env, jclass clazz) {
-    static auto class_getName = env->GetMethodID(
-            env->FindClass("java/lang/Class"), "getName", "()Ljava/lang/String;");
-    auto nameRef = (jstring) env->CallObjectMethod(clazz, class_getName);
-    const char *name = env->GetStringUTFChars(nameRef, nullptr);
-    string className(name);
-    env->ReleaseStringUTFChars(nameRef, name);
-    std::replace(className.begin(), className.end(), '.', '/');
-    return className;
-}
-
-static void replace_jni_methods(
-        vector<JNINativeMethod> &methods, vector<JNINativeMethod> &backup,
-        const JNINativeMethod *hook_methods, size_t hook_methods_size,
-        void **orig_function) {
-    for (auto &method : methods) {
-        if (strcmp(method.name, hook_methods[0].name) == 0) {
-            for (auto i = 0; i < hook_methods_size; ++i) {
-                const auto &hook = hook_methods[i];
-                if (strcmp(method.signature, hook.signature) == 0) {
-                    backup.push_back(method);
-                    *orig_function = method.fnPtr;
-                    method.fnPtr = hook.fnPtr;
-                    ZLOGI("replace %s\n", method.name);
-                    return;
-                }
-            }
-            ZLOGE("unknown signature of %s%s\n", method.name, method.signature);
+void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods methods) {
+    jclass clazz;
+    if (!runtime_callbacks || !env || !clz || !(clazz = env->FindClass(clz))) {
+        for (auto &method : methods) {
+            method.fnPtr = nullptr;
         }
+        return;
+    }
+
+    // Backup existing methods
+    auto total = runtime_callbacks->getNativeMethodCount(env, clazz);
+    auto old_methods = std::make_unique_for_overwrite<JNINativeMethod[]>(total);
+    runtime_callbacks->getNativeMethods(env, clazz, old_methods.get(), total);
+    auto new_methods = std::make_unique_for_overwrite<JNINativeMethod[]>(total);
+
+    // Replace the method
+    for (auto &method : methods) {
+        // It's useful to allow nullptr function pointer for restoring hook
+        if (!method.fnPtr) continue;
+        // It's normal that the method is not found
+        if (env->RegisterNatives(clazz, &method, 1) == JNI_ERR ||
+            env->ExceptionCheck() == JNI_TRUE) {
+            if (auto exception = env->ExceptionOccurred()) {
+                env->DeleteLocalRef(exception);
+            }
+            env->ExceptionClear();
+            method.fnPtr = nullptr;
+            continue;
+        }
+        // Find the old function pointer and return to caller
+        runtime_callbacks->getNativeMethods(env, clazz, new_methods.get(), total);
+        for (auto i = 0; i < total; ++i) {
+            auto &new_method = new_methods[i];
+            if (new_method.fnPtr == method.fnPtr && strcmp(new_method.name, method.name) == 0) {
+                auto &old_method = old_methods[i];
+                ZLOGD("replace %s#%s%s %p -> %p\n", clz,
+                      method.name, method.signature, old_method.fnPtr, method.fnPtr);
+                method.fnPtr = old_method.fnPtr;
+                break;
+            }
+        }
+        old_methods.swap(new_methods);
     }
 }
 
-#define HOOK_JNI(method) \
-replace_jni_methods(newMethods, backup, method##_methods.data(), method##_methods.size(), &method##_orig)
-
-static jint env_RegisterNatives(
-        JNIEnv *env, jclass clazz, const JNINativeMethod *methods, jint numMethods) {
-    auto className = get_class_name(env, clazz);
-    if (className == "com/android/internal/os/Zygote") {
-        // Restore JNIEnv as we no longer need to replace anything
-        env->functions = g_hook->old_env;
-
-        vector<JNINativeMethod> newMethods(methods, methods + numMethods);
-        vector<JNINativeMethod> &backup = g_hook->jni_backup[className];
-        HOOK_JNI(nativeForkAndSpecialize);
-        HOOK_JNI(nativeSpecializeAppProcess);
-        HOOK_JNI(nativeForkSystemServer);
-        return g_hook->old_env->RegisterNatives(env, clazz, newMethods.data(), numMethods);
-    } else {
-        return g_hook->old_env->RegisterNatives(env, clazz, methods, numMethods);
-    }
-}
-
-void HookContext::hook_jni_env() {
+void HookContext::hook_zygote_jni() {
     using method_sig = jint(*)(JavaVM **, jsize, jsize *);
     auto get_created_vms = reinterpret_cast<method_sig>(
             dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
@@ -525,68 +525,21 @@ void HookContext::hook_jni_env() {
     res = vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
     if (res != JNI_OK || env == nullptr) {
         ZLOGW("JNIEnv not found\n");
-        return;
     }
-
-    // Replace the function table in JNIEnv to hook RegisterNatives
-    memcpy(&new_env, env->functions, sizeof(*env->functions));
-    new_env.RegisterNatives = &env_RegisterNatives;
-    old_env = env->functions;
-    env->functions = &new_env;
+    hook_jni_methods(env, kZygote, zygote_methods);
 }
 
-void HookContext::restore_jni_hook(JNIEnv *env) {
-    for (const auto &[clz, methods] : jni_backup) {
-        if (!methods.empty() && env->RegisterNatives(
-                env->FindClass(clz.data()), methods.data(),
-                static_cast<int>(methods.size())) != 0) {
-            ZLOGE("Failed to restore JNI hook of class [%s]\n", clz.data());
-            should_unmap_zygisk = false;
-        }
-    }
+void HookContext::restore_zygote_hook(JNIEnv *env) {
+    hook_jni_methods(env, kZygote, zygote_methods);
 }
 
 // -----------------------------------------------------------------
 
-void hook_functions() {
+void hook_entry() {
     default_new(g_hook);
     g_hook->hook_plt();
 }
 
 void hookJniNativeMethods(JNIEnv *env, const char *clz, JNINativeMethod *methods, int numMethods) {
-    jclass clazz;
-    if (!g_hook || !g_hook->runtime_callbacks || !env || !clz || !(clazz = env->FindClass(clz))) {
-        for (auto i = 0; i < numMethods; ++i) {
-            methods[i].fnPtr = nullptr;
-        }
-        return;
-    }
-
-    // Backup existing methods
-    auto total = g_hook->runtime_callbacks->getNativeMethodCount(env, clazz);
-    vector<JNINativeMethod> old_methods(total);
-    g_hook->runtime_callbacks->getNativeMethods(env, clazz, old_methods.data(), total);
-
-    // Replace the method
-    for (auto i = 0; i < numMethods; ++i) {
-        auto &method = methods[i];
-        auto res = env->RegisterNatives(clazz, &method, 1);
-        // It's normal that the method is not found
-        if (res == JNI_ERR || env->ExceptionCheck()) {
-            auto exception = env->ExceptionOccurred();
-            if (exception) env->DeleteLocalRef(exception);
-            env->ExceptionClear();
-            method.fnPtr = nullptr;
-        } else {
-            // Find the old function pointer and return to caller
-            for (const auto &old_method : old_methods) {
-                if (strcmp(method.name, old_method.name) == 0 &&
-                    strcmp(method.signature, old_method.signature) == 0) {
-                    ZLOGD("replace %s#%s%s %p -> %p\n", clz,
-                          method.name, method.signature, old_method.fnPtr, method.fnPtr);
-                    method.fnPtr = old_method.fnPtr;
-                }
-            }
-        }
-    }
+    g_hook->hook_jni_methods(env, clz, { methods, (size_t) numMethods });
 }

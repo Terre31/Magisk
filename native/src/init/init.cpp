@@ -6,14 +6,18 @@
 #include <xz.h>
 
 #include <base.hpp>
-#include <embed.hpp>
 
 #include "init.hpp"
 
 using namespace std;
 
 #ifdef USE_CRT0
-__asm__(".global vfprintf \n vfprintf = tfp_vfprintf");
+__BEGIN_DECLS
+int tiny_vfprintf(FILE *stream, const char *format, va_list arg);
+int vfprintf(FILE *stream, const char *format, va_list arg) {
+    return tiny_vfprintf(stream, format, arg);
+}
+__END_DECLS
 #endif
 
 bool unxz(out_stream &strm, rust::Slice<const uint8_t> bytes) {
@@ -86,15 +90,17 @@ int main(int argc, char *argv[]) {
     } else {
         // This will also mount /sys and /proc
         load_kernel_info(&config);
+        bool recovery = access("/sbin/recovery", F_OK) == 0 ||
+                        access("/system/bin/recovery", F_OK) == 0;
 
-        if (config.skip_initramfs)
+        if (config.force_normal_boot)
+            init = new FirstStageInit(argv, &config);
+        else if (!recovery && check_two_stage())
+            init = new FirstStageInit(argv, &config);
+        else if (config.skip_initramfs)
             init = new LegacySARInit(argv, &config);
-        else if (config.force_normal_boot)
-            init = new FirstStageInit(argv, &config);
-        else if (access("/sbin/recovery", F_OK) == 0 || access("/system/bin/recovery", F_OK) == 0)
+        else if (recovery)
             init = new RecoveryInit(argv, &config);
-        else if (check_two_stage())
-            init = new FirstStageInit(argv, &config);
         else
             init = new RootFSInit(argv, &config);
     }
